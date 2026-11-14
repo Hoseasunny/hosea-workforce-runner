@@ -57,22 +57,31 @@ async function integrationRequest(service, operation, payload = {}) {
 
    const body = await response.json().catch(() => ({}));
 
-
-
-   if (!response.ok || body.ok === false) {
-
-      throw new Error(
-
-         body.error || body.message || `Integration HTTP ${response.status}`
-
-      );
-
+   // Safe diagnostics for Notion page creation. Log response structure and
+   // status only; never log request headers, tokens, or report contents.
+   if (service === "notion" && operation === "create_page") {
+      const result = body?.result;
+      const page = result?.page;
+      console.log("[Notion Debug] Create-page response:", JSON.stringify({
+         httpStatus: response.status,
+         responseOk: response.ok,
+         bodyOk: body?.ok,
+         topLevelKeys: Object.keys(body || {}),
+         resultKeys: result && typeof result === "object" ? Object.keys(result) : [],
+         pageKeys: page && typeof page === "object" ? Object.keys(page) : [],
+         hasPageId: Boolean(page?.id),
+         hasPageUrl: Boolean(page?.url),
+         error: typeof body?.error === "string" ? body.error.slice(0, 240) : undefined
+      }));
    }
 
-
+   if (!response.ok || body.ok === false) {
+      throw new Error(
+         body.error || body.message || `Integration HTTP ${response.status}`
+      );
+   }
 
    return body;
-
 }
 
 async function generateAgentResponse(task, context, agent) {
