@@ -125,139 +125,87 @@ async function generateAgentResponse(task, context, agent) {
 }
 
 async function saveResearchToNotion(task, result) {
-
    const parentId = process.env.NOTION_PARENT_PAGE_ID;
-
-
-
    if (!parentId) {
-
       throw new Error("NOTION_PARENT_PAGE_ID is missing from .env.txt");
-
    }
-
-
 
    const agent = String(task.assigned_agent_id || "research");
-
    const taskTitle = String(task.title || "Research").slice(0, 75);
-
    const pageTitle = `Task ${task.id} - ${agent} - ${taskTitle}`;
 
-
-
-   // Check whether this task already has a Notion report.
-
+   // Search first so retries do not create duplicate report pages.
    const search = await integrationRequest("notion", "search", {
-
       query: pageTitle
-
    });
-
-
-
    const pages = search?.result?.data?.results || [];
 
-
-
    function getPageTitle(page) {
-
       const properties = page?.properties || {};
-
-
-
       for (const property of Object.values(properties)) {
-
          if (property?.type === "title" && Array.isArray(property.title)) {
-
             return property.title
-
                .map(item => item.plain_text || item.text?.content || "")
-
                .join("");
-
          }
-
       }
-
-
-
       return "";
-
    }
 
-
-
-   const existingPage = pages.find(
-
-      page => getPageTitle(page) === pageTitle
-
-   );
-
-
-
+   const existingPage = pages.find(page => getPageTitle(page) === pageTitle);
    if (existingPage) {
-
-      return "existing report found; duplicate avoided";
-
+      if (!existingPage.id || !existingPage.url) {
+         throw new Error("A matching Notion report was found, but its page ID or URL was missing.");
+      }
+      return `existing report verified: ${existingPage.url}`;
    }
 
-
-
-   const fullContent = [
-
+   // The integration endpoint accepts at most 10 paragraphs. Keep metadata
+   // in one paragraph and split the findings into bounded paragraphs.
+   const metadata = [
       "HOSEA AI WORKFORCE RESEARCH REPORT",
+      `Agent: ${agent}`,
+      `Task ID: ${task.id}`,
+      `Task: ${taskTitle}`,
+      `Worker: ${WORKER_ID}`,
+      `Generated: ${new Date().toISOString()}`
+   ].join(" | ");
 
-      "",
+   const findings = String(result || "No findings were returned.")
+      .replace(/\r\n?/g, "\n")
+      .trim();
+   const chunks = [];
+   const chunkSize = 1400;
+   for (let offset = 0; offset < findings.length && chunks.length < 8; offset += chunkSize) {
+      chunks.push(findings.slice(offset, offset + chunkSize));
+   }
+   const omittedChars = Math.max(0, findings.length - chunks.length * chunkSize);
+   if (omittedChars > 0) {
+      const last = chunks.length - 1;
+      chunks[last] = chunks[last].slice(0, 1250) +
+         `\n[Report truncated; ${omittedChars} additional characters omitted.]`;
+   }
 
-      "Agent: " + agent,
-
-      "Task ID: " + task.id,
-
-      "Task: " + taskTitle,
-
-      "Worker: " + WORKER_ID,
-
-      "Generated: " + new Date().toISOString(),
-
-      "",
-
+   const content = [
+      metadata,
       "RESEARCH FINDINGS",
+      ...chunks
+   ].join("\n\n");
 
-      "",
-
-      String(result)
-
-   ].join("\n");
-
-
-
-   // Notion rich-text objects have a 2,000-character limit.
-
-   const content = fullContent.length > 1800
-
-      ? fullContent.slice(0, 1750) +
-
-         "\n\n[Report shortened to fit the current Notion integration limit.]"
-
-      : fullContent;
-
-
-
-   await integrationRequest("notion", "create_page", {
-
+   const created = await integrationRequest("notion", "create_page", {
       parent_page_id: parentId,
-
       title: pageTitle,
-
       content
-
    });
 
+   // The API can return HTTP success without a usable page object. Do not
+   // report success unless Notion returns both the page ID and its URL.
+   const page = created?.result?.page;
+   if (!page?.id || !page?.url) {
+      throw new Error("Notion did not confirm page creation (page ID or URL missing). The report was not marked as saved.");
+   }
 
-
-   return "report created successfully";
-
+   return `report created and verified: ${page.url}`;
 }
 
 async function researchTask(task) {
