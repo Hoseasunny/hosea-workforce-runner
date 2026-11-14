@@ -1141,12 +1141,17 @@ function queueReport(report) {
 
 async function sendReport(report) {
   queueReport(report);
-  const response = await request("report", report);
-  const remaining = readOutbox().filter(item =>
-    !(Number(item.task_id) === Number(report.task_id) && item.status === report.status)
-  );
-  writeOutbox(remaining);
-  return response;
+  try {
+    const response = await request("report", report);
+    const remaining = readOutbox().filter(item =>
+      !(Number(item.task_id) === Number(report.task_id) && item.status === report.status)
+    );
+    writeOutbox(remaining);
+    return response;
+  } catch (error) {
+    console.error(`[Outbox] Task #${report.task_id} saved locally; server submission will be retried: ${error.message}`);
+    return { queued: true };
+  }
 }
 
 async function flushOutbox() {
