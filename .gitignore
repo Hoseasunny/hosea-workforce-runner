@@ -2,3 +2,5 @@
 .env.txt
 node_modules/
 *.log
+runner-outbox.json
+runner-outbox.json.tmp
