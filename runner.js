@@ -1,3 +1,6 @@
+const fs = require("node:fs");
+const path = require("node:path");
+
 const API_URL = (process.env.WORKFORCE_API_URL || "https://hosea-ai-workforce.hatchable.site/api").replace(/\/+$/, "");
 
 const TOKEN = process.env.WORKFORCE_RUNNER_TOKEN;
@@ -90,6 +93,9 @@ async function generateAgentResponse(task, context, agent) {
     "",
     "Existing task context, evidence or planning outline:",
     String(context || "No additional context supplied.").slice(0, 9000),
+    "",
+    "Collaboration context from completed predecessor agents:",
+    String(task.collaboration_context || "No predecessor reports supplied.").slice(0, 9000),
     "",
     "Now produce the final response for this task. Be specific and do not repeat generic filler."
   ].join("\n");
@@ -928,6 +934,32 @@ const handlers = {
 
 
 
+   "data-analyst": task => [
+      "DATA ANALYSIS PLAN",
+      `Task: ${task.title}`,
+      "",
+      "1. Define the question, decision and measurable outcome.",
+      "2. Identify required datasets, owners, formats and collection limits.",
+      "3. Check missing values, duplicates, outliers and data quality.",
+      "4. Select suitable descriptive statistics and visualisations.",
+      "5. State assumptions, limitations and reproducible validation steps.",
+      "",
+      "Planning only; no datasets were accessed or modified."
+   ].join("\n"),
+
+   "finance": task => [
+      "FINANCE AND EARNINGS TRACKING PLAN",
+      `Task: ${task.title}`,
+      "",
+      "1. Define the financial objective and reporting period.",
+      "2. List income sources, expenses and relevant evidence.",
+      "3. Separate confirmed transactions from estimates and forecasts.",
+      "4. Calculate totals, net cash flow and category-level trends.",
+      "5. Flag missing records, risks and decisions requiring human approval.",
+      "",
+      "Planning only; no accounts were accessed and no transactions were made."
+   ].join("\n"),
+
    "qa": task => [
 
       "QA TEST PLAN",
@@ -1082,6 +1114,59 @@ const handlers = {
 
 
 
+const OUTBOX_PATH = path.join(__dirname, "runner-outbox.json");
+
+function readOutbox() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(OUTBOX_PATH, "utf8"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    console.error("[Outbox] Could not read outbox:", error.message);
+    throw error;
+  }
+}
+
+function writeOutbox(items) {
+  const temporaryPath = OUTBOX_PATH + ".tmp";
+  fs.writeFileSync(temporaryPath, JSON.stringify(items, null, 2), "utf8");
+  fs.renameSync(temporaryPath, OUTBOX_PATH);
+}
+
+function queueReport(report) {
+  const items = readOutbox().filter(item => Number(item.task_id) !== Number(report.task_id));
+  items.push({ ...report, queued_at: new Date().toISOString() });
+  writeOutbox(items);
+}
+
+async function sendReport(report) {
+  queueReport(report);
+  const response = await request("report", report);
+  const remaining = readOutbox().filter(item =>
+    !(Number(item.task_id) === Number(report.task_id) && item.status === report.status)
+  );
+  writeOutbox(remaining);
+  return response;
+}
+
+async function flushOutbox() {
+  const pending = readOutbox();
+  if (!pending.length) return;
+  console.log(`[Outbox] Retrying ${pending.length} saved report(s).`);
+  for (const report of pending) {
+    try {
+      const response = await request("report", report);
+      const remaining = readOutbox().filter(item =>
+        !(Number(item.task_id) === Number(report.task_id) && item.status === report.status)
+      );
+      writeOutbox(remaining);
+      console.log(`[Outbox] Task #${report.task_id} accepted: ${response.note || response.task?.status || "OK"}`);
+    } catch (error) {
+      console.error(`[Outbox] Task #${report.task_id} remains saved: ${error.message}`);
+    }
+  }
+}
+
 async function request(action, extra = {}) {
 
    const response = await fetch(`${API_URL}/runner`, {
@@ -1104,7 +1189,8 @@ async function request(action, extra = {}) {
 
          ...extra
 
-      })
+      }),
+      signal: AbortSignal.timeout(20000)
 
    });
 
@@ -1143,149 +1229,79 @@ async function request(action, extra = {}) {
 
 
 async function processTask(task) {
-
    console.log(`Claimed task #${task.id}: ${task.title}`);
-
    const agent = task.assigned_agent_id;
-
    const handler = handlers[agent];
+   let heartbeatBusy = false;
 
-
-
-   if (!handler) {
-
-      await request("report", {
-
-         task_id: task.id,
-
-         status: "blocked",
-
-         error: `No local handler is configured for agent: ${agent}`
-
-      });
-
-      console.log(`Task #${task.id} blocked: unsupported agent.`);
-
-      return;
-
-   }
-
-
+   const heartbeat = setInterval(async () => {
+      if (heartbeatBusy) return;
+      heartbeatBusy = true;
+      try {
+         await request("heartbeat", { task_id: task.id });
+         console.log(`[Heartbeat] Task #${task.id} lease renewed.`);
+      } catch (error) {
+         console.error(`[Heartbeat] Task #${task.id} renewal failed: ${error.message}`);
+      } finally {
+         heartbeatBusy = false;
+      }
+   }, 60000);
 
    try {
+      if (!handler) {
+         await sendReport({
+            task_id: task.id,
+            status: "blocked",
+            error: `No local handler is configured for agent: ${agent}`
+         });
+         console.log(`Task #${task.id} blocked: unsupported agent.`);
+         return;
+      }
 
       let result = await handler(task);
-
       if (agent !== "pentest") {
-        const sourceContext = result;
-        const modelResult = await generateAgentResponse(task, sourceContext, agent);
-        console.log(`[Model] Task #${task.id} answered by ${modelResult.provider}/${modelResult.model}.`);
-        result = modelResult.text;
+         const sourceContext = result;
+         const modelResult = await generateAgentResponse(task, sourceContext, agent);
+         console.log(`[Model] Task #${task.id} answered by ${modelResult.provider}/${modelResult.model}.`);
+         result = modelResult.text;
 
-        const evidenceAgents = [
-          "research",
-          "security-research",
-          "opportunities",
-          "freelance",
-          "business-dev",
-          "learning"
-        ];
-
-        if (evidenceAgents.includes(agent)) {
-          result += "\n\n--- SOURCE EVIDENCE RETRIEVED BY THE RUNNER ---\n" + sourceContext;
-        }
+         const evidenceAgents = [
+            "research", "security-research", "opportunities",
+            "freelance", "business-dev", "learning"
+         ];
+         if (evidenceAgents.includes(agent)) {
+            result += "\n\n--- SOURCE EVIDENCE RETRIEVED BY THE RUNNER ---\n" + sourceContext;
+         }
       }
 
       const persistentAgents = [
-
-         "research",
-
-         "security-research",
-
-         "opportunities",
-
-         "freelance",
-
-         "business-dev",
-
-         "learning"
-
+         "research", "security-research", "opportunities",
+         "freelance", "business-dev", "learning"
       ];
-
-
-
       if (persistentAgents.includes(agent)) {
-
          try {
-
             const saveStatus = await saveResearchToNotion(task, result);
-
             console.log(`Task #${task.id}: Notion ${saveStatus}.`);
-
          } catch (notionError) {
-
-            console.error(
-
-               `Task #${task.id}: Notion save failed:`,
-
-               notionError.message
-
-            );
-
-
-
-            result +=
-
-               "\n\nNOTION STORAGE WARNING: " +
-
-               notionError.message +
-
+            console.error(`Task #${task.id}: Notion save failed:`, notionError.message);
+            result += "\n\nNOTION STORAGE WARNING: " + notionError.message +
                ". The workforce task result was still submitted.";
-
          }
-
       }
 
-
-
-      await request("report", {
-
-         task_id: task.id,
-
-         status: "completed",
-
-         result
-
-      });
-
-
-
-      console.log(`Task #${task.id}: result saved.`);
-
+      await sendReport({ task_id: task.id, status: "completed", result });
+      console.log(`Task #${task.id}: result accepted or safely queued.`);
    } catch (error) {
-
-      await request("report", {
-
-         task_id: task.id,
-
-         status: "failed",
-
-         error: error.message
-
-      }).catch(reportError => {
-
-         console.error("Could not submit failure report:", reportError.message);
-
-      });
-
-
-
+      try {
+         await sendReport({ task_id: task.id, status: "failed", error: error.message });
+      } catch (reportError) {
+         console.error("Could not safely queue failure report:", reportError.message);
+      }
       console.error(`Task #${task.id} failed:`, error.message);
-
+   } finally {
+      clearInterval(heartbeat);
    }
-
 }
-
 
 
 async function main() {
@@ -1313,6 +1329,7 @@ async function main() {
 
       try {
 
+         await flushOutbox();
          const data = await request("claim");
 
 
